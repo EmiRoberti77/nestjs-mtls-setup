@@ -37,6 +37,59 @@ All certificates are issued by a **local dev CA** you create with OpenSSL script
 
 Private keys never leave the machine; the handshake only proves possession of the key.
 
+## Onboarding clients and distributing certificates
+
+You (or your PKI process) are responsible for **issuing** credentials. Callers do not generate their own client certs unless you give them a CSR workflow.
+
+### One CA per environment — new cert per client
+
+| Item | Per new client? | Notes |
+|------|-----------------|-------|
+| **CA** (`ca.crt` / `ca.key`) | **No** | One CA per trust domain (e.g. dev, prod). All services use the same `ca.crt` to verify peers. |
+| **Client cert + key** | **Yes** | Issue a **unique** `client.crt` + `client.key` per integrating service (e.g. `payments`, `reporting`). |
+| **Server cert + key** | N/A | One pair for your Nest server, signed by the same CA. |
+
+```
+One CA (ca.crt + ca.key — ca.key never leaves your control)
+    ├── server.crt + server.key       ← your Nest server
+    ├── payments.crt + payments.key   ← client A
+    ├── reporting.crt + reporting.key ← client B
+    └── ...
+```
+
+Create a new CA only for a **new environment** or **security boundary**, not for every new client. To onboard client B, re-run signing (adapt `client.ps1` with a new `-subj "/CN=reporting"`) — do not create `ca.ps1` again.
+
+### Files to give each connecting service
+
+Give the integrating team **three files**:
+
+| File | Purpose |
+|------|---------|
+| **`ca.crt`** | Trust your HTTPS server (and optionally other internal peers). Same file for all clients in that environment — send once if they do not already have it. |
+| **`client.crt`** | Their service identity (signed by your CA). **Unique per client.** |
+| **`client.key`** | Private key for that cert. **Secret** — treat like a password; prefer a secrets manager over email. |
+
+They configure them the same way as `src/client/client.tsx` (`ca`, `cert`, `key` on `https.Agent` or equivalent).
+
+### Do not share
+
+| File | Why |
+|------|-----|
+| **`ca.key`** | Anyone with it can mint trusted certificates. |
+| **`server.key`** | Your server private key. |
+| **`server.crt`** | Usually unnecessary — TLS sends it during the handshake; clients trust it via `ca.crt`. |
+| **Another team's `client.key`** | Each client gets only their own key. |
+| **`*.csr`, `*.ext`, `*.srl`, `*.ps1`** | Generation artifacts; not used at runtime. |
+
+### What you keep on the server
+
+| File | Role |
+|------|------|
+| `ca.crt` | Verify incoming client certificates |
+| `server.crt` + `server.key` | Present server identity to clients |
+
+In production, distribute bundles via Vault, Kubernetes secrets, cert-manager, or a service mesh — not ad-hoc file shares.
+
 ## Project layout
 
 ```
@@ -234,6 +287,45 @@ const cert = req.socket.getPeerCertificate();
 ```
 
 This sample does not implement that guard yet — any cert signed by your CA is accepted.
+
+## mTLS vs API keys in HTTP headers
+
+Client certificates and API keys both authenticate callers, but at **different layers** and for **different jobs**.
+
+### What mTLS replaces well
+
+If an API key in a header only means **“this integrated system is allowed to connect”**, mTLS can replace it:
+
+| API key in header | mTLS equivalent |
+|-------------------|-----------------|
+| `Authorization: Bearer …` or `X-API-Key: …` | Valid **`client.crt` + `client.key`** during the TLS handshake |
+| Shared secret rotated manually | Per-client cert you issue or revoke |
+| “Is this request from an approved integration?” | Node verifies the cert **before** Nest runs (`requestCert` + `rejectUnauthorized` in `main.ts`) |
+
+This sample has **no** API-key guard — TLS is the gate. A caller without your client cert never reaches your controllers.
+
+### What mTLS does not replace by itself
+
+| API keys / tokens often handle | mTLS alone |
+|--------------------------------|------------|
+| **End-user identity** (Alice vs Bob) | Identifies the **service** (`CN=my-client`), not the human user |
+| **Scopes** (`read:orders`, `admin`) | Requires app logic (e.g. map cert CN → roles) |
+| **Per-resource authorization** | Still JWT, sessions, or policy in Nest guards |
+| **Browser / mobile public APIs** | mTLS is awkward in browsers; JWT or API keys are common |
+
+**Short version:**
+
+- **mTLS** → “Which **machine / service** is calling?”
+- **API key / JWT** → “Which **user** or **token** is allowed to do **what**?”
+
+### Common production patterns
+
+| Pattern | Use when |
+|---------|----------|
+| **mTLS only** | Service-to-service; identity = client cert CN |
+| **mTLS + JWT** | TLS proves the service; JWT proves the user or action inside the service |
+| **mTLS + API key** | Rare redundancy for machine clients |
+| **API key + public HTTPS only** | Simpler ops; no client cert lifecycle (still use TLS for encryption) |
 
 ## Security notes (local dev only)
 
