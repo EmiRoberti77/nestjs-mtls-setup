@@ -366,6 +366,5 @@ This sample has **no** API-key guard — TLS is the gate. A caller without your 
 - [RFC 8446 — TLS 1.3](https://datatracker.ietf.org/doc/html/rfc8446)
 - [NestJS FAQ — HTTP adapter](https://docs.nestjs.com/faq/http-adapter)
 
-## License
-
-UNLICENSED (private sample project).
+-
+Emi Roberti
