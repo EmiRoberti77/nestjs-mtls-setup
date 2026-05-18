@@ -1,98 +1,279 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# mTLS Sample — NestJS Server + Node Client
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+A minimal **mutual TLS (mTLS)** demo: a NestJS HTTPS server that requires a client certificate, and a Node.js client that presents one. Both sides trust the same local Certificate Authority (CA).
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## What is mTLS?
 
-## Description
+| | Normal HTTPS | mTLS |
+|---|--------------|------|
+| Server proves identity | Yes | Yes |
+| Client proves identity | No (password/cookie/API key later) | **Yes (certificate)** |
+| Anonymous clients | Allowed | **Rejected** (with this config) |
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+TLS encrypts traffic and authenticates the **server**. mTLS adds authentication of the **client** during the TLS handshake, before HTTP runs.
 
-## Project setup
+## Trust model (this project)
 
-```bash
-$ pnpm install
+All certificates are issued by a **local dev CA** you create with OpenSSL scripts in `certs/`.
+
+```
+                    ca.crt  (+ ca.key — keep private)
+                   "Local Dev CA"
+                          |
+          +---------------+---------------+
+          |                               |
+    server.crt                        client.crt
+    CN=localhost                      CN=my-client
+    EKU: serverAuth                   EKU: clientAuth
+    SAN: localhost, 127.0.0.1
+          |                               |
+    server.key                        client.key
+    (private)                         (private)
 ```
 
-## Compile and run the project
+- **`ca.crt`** — trust anchor. Both server and client load it to decide which peers they accept.
+- **`server.crt` + `server.key`** — server identity (TLS server role).
+- **`client.crt` + `client.key`** — client identity (TLS client role).
 
-```bash
-# development
-$ pnpm run start
+Private keys never leave the machine; the handshake only proves possession of the key.
 
-# watch mode
-$ pnpm run start:dev
+## Project layout
 
-# production mode
-$ pnpm run start:prod
+```
+mtls_server/
+├── certs/                 # PKI assets (generated locally, gitignored)
+│   ├── ca.ps1             # Create CA
+│   ├── server.ps1         # Server cert + SAN
+│   ├── client.ps1         # Client cert + clientAuth
+│   ├── ca.crt / ca.key
+│   ├── server.crt / server.key
+│   └── client.crt / client.key
+├── src/
+│   ├── main.ts            # Nest HTTPS + mTLS options
+│   └── client/
+│       └── client.tsx     # axios + https.Agent (mTLS client)
+└── package.json
 ```
 
-## Run tests
+## How mTLS exchanges data (overview)
 
-```bash
-# unit tests
-$ pnpm run test
+```mermaid
+flowchart TB
+    subgraph AppLayer["Application layer (after TLS)"]
+        HTTP["HTTP: GET / → JSON/text response"]
+    end
 
-# e2e tests
-$ pnpm run test:e2e
+    subgraph TLS["TLS record layer (encrypted)"]
+        REC["Encrypted records: headers + body"]
+    end
 
-# test coverage
-$ pnpm run test:cov
+    subgraph Handshake["TLS handshake (once per connection)"]
+        H["Certificate exchange + key agreement + Finished"]
+    end
+
+    Client["client.tsx"] --> Handshake
+    Handshake --> Server["main.ts / NestJS"]
+    Handshake --> TLS
+    TLS --> AppLayer
 ```
 
-## Deployment
+1. **Handshake** — negotiate TLS version/ciphers; exchange and verify certificates; derive session keys.
+2. **Record layer** — all HTTP bytes are encrypted/authenticated inside TLS records.
+3. **HTTP** — Nest sees a normal `IncomingMessage`; TLS is already done in Node's `https` server.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+## TLS handshake (detailed sequence)
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+This is what happens when you run `pnpm run client` against `pnpm run start`:
 
-```bash
-$ pnpm install -g @nestjs/mau
-$ mau deploy
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client (client.tsx)
+    participant S as Server (main.ts)
+
+    Note over C,S: ClientHello / ServerHello<br/>Agree TLS version and ciphers
+
+    S->>C: Certificate (server.crt)
+    Note over C: Verify server.crt signed by ca.crt<br/>Check SAN matches localhost
+
+    S->>C: CertificateRequest
+    Note over S: requestCert: true
+
+    C->>S: Certificate (client.crt)
+    Note over C: Prove ownership of client.key<br/>(sign handshake data)
+
+    Note over S: Verify client.crt signed by ca.crt<br/>rejectUnauthorized: true
+
+    C->>S: Finished (encrypted)
+    S->>C: Finished (encrypted)
+
+    Note over C,S: Session keys derived — channel is encrypted
+
+    C->>S: GET / (HTTP inside TLS)
+    S->>C: 200 Hello World! (HTTP inside TLS)
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+If any verification step fails, Node aborts the connection — your Nest controller never runs.
 
-## Resources
+## What each side configures
 
-Check out a few resources that may come in handy when working with NestJS:
+### Server (`src/main.ts`)
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+```typescript
+httpsOptions: {
+  key: server.key,
+  cert: server.crt,
+  ca: ca.crt,                    // which client CAs to trust
+  requestCert: true,             // ask client for a certificate
+  rejectUnauthorized: true,      // reject if client cert invalid/missing
+}
+```
 
-## Support
+| Option | Effect |
+|--------|--------|
+| `key` / `cert` | Server presents its identity to clients |
+| `ca` | Only client certs signed by this CA are accepted |
+| `requestCert` | Enables mutual TLS (client must send a cert) |
+| `rejectUnauthorized` | Do not allow connections without a valid client cert |
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+### Client (`src/client/client.tsx`)
 
-## Stay in touch
+```typescript
+new https.Agent({
+  ca: ca.crt,                    // trust server certs from this CA
+  cert: client.crt,              // client identity
+  key: client.key,
+  rejectUnauthorized: true,      // reject if server cert invalid
+})
+```
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+| Field | Effect |
+|-------|--------|
+| `ca` | Trust server only if `server.crt` chains to this CA |
+| `cert` / `key` | Present client identity when server requests it |
+| `rejectUnauthorized` | Fail if server cert is wrong/expired/wrong host |
+
+## Certificate generation
+
+Certificate files (`*.crt`, `*.key`, etc.) are listed in `.gitignore`. Generate them locally before running the app.
+
+From `certs/` (requires OpenSSL; PowerShell scripts set `OPENSSL_CONF` for Anaconda/Git OpenSSL on Windows):
+
+```powershell
+cd certs
+.\ca.ps1       # ca.key, ca.crt (10-year self-signed CA)
+.\server.ps1   # server.key, server.crt (SAN: localhost, 127.0.0.1)
+.\client.ps1   # client.key, client.crt (EKU: clientAuth)
+```
+
+**Extensions matter:**
+
+- **Server** — `subjectAltName` so `https://localhost` validates; `extendedKeyUsage=serverAuth`.
+- **Client** — `extendedKeyUsage=clientAuth` so the cert is valid for client authentication.
+
+## Running the demo
+
+This project uses **pnpm** (`pnpm-lock.yaml`).
+
+```powershell
+# From project root (mtls_server/)
+pnpm install
+
+# If pnpm reports ERR_PNPM_IGNORED_BUILDS, approve builds first:
+#   pnpm approve-builds --all
+# Then set allowBuilds in pnpm-workspace.yaml to true for @nestjs/core, esbuild, unrs-resolver
+
+pnpm run start          # Terminal 1 — HTTPS on :3000
+
+pnpm run client         # Terminal 2 — mTLS GET https://localhost:3000
+```
+
+Expected client output: `Hello World!` (or your controller response).
+
+## What fails without mTLS pieces
+
+| Scenario | Result |
+|----------|--------|
+| Browser / curl without client cert | TLS handshake fails (server requires cert) |
+| Client without `ca.crt` matching server | Client rejects server |
+| Client with random cert (not signed by `ca.crt`) | Server rejects client |
+| `rejectUnauthorized: false` | May connect but **skips verification** — not secure |
+
+## Data flow after the handshake (one HTTP request)
+
+```mermaid
+flowchart LR
+    subgraph ClientProcess["Node client process"]
+        A1["axios.get(url, { httpsAgent })"]
+        A2["TLS encrypts HTTP request"]
+    end
+
+    subgraph Network["TCP :3000"]
+        N["Ciphertext on the wire"]
+    end
+
+    subgraph ServerProcess["Node server process"]
+        B1["TLS decrypts → plain HTTP"]
+        B2["Nest routing → AppController"]
+        B3["TLS encrypts response"]
+    end
+
+    A1 --> A2 --> N --> B1 --> B2 --> B3 --> N --> A2
+```
+
+- **On the wire:** only encrypted TLS records (certificates are sent during the handshake; application data is encrypted afterward).
+- **In Nest:** `req` / `res` look like normal HTTP; certificate details are available on `req.socket` if you want to read the client CN later.
+
+## Optional: reading the client identity in Nest
+
+TLS verification happens in Node before Nest. To use the client name in app logic:
+
+```typescript
+const cert = req.socket.getPeerCertificate();
+// cert.subject.CN → e.g. "my-client"
+```
+
+This sample does not implement that guard yet — any cert signed by your CA is accepted.
+
+## Security notes (local dev only)
+
+- **`ca.key`** is highly sensitive; do not commit or share it.
+- This CA is **not** in browsers' trust stores — only your client uses it via `ca: fs.readFileSync('ca.crt')`.
+- Certificates here are for **learning**; use proper PKI/HSM/processes in production.
+- Rotating certs: re-run the `.ps1` scripts and restart server/client.
+
+## Scripts reference
+
+| Script | Command |
+|--------|---------|
+| Start server | `pnpm run start` |
+| Start server (watch) | `pnpm run start:dev` |
+| Run mTLS client | `pnpm run client` |
+| Build | `pnpm run build` |
+
+## Dependencies
+
+- **Server:** NestJS with Node `https` options passed to `NestFactory.create`.
+- **Client:** `axios` + Node `https.Agent`.
+- **Client runner:** `tsx` (`pnpm run client`).
+
+## Troubleshooting
+
+| Problem | Check |
+|---------|--------|
+| `ENOENT` on cert paths | Generate certs in `certs/`; run server from project root (`process.cwd()/certs`) |
+| `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | Client `ca` must be your `ca.crt` |
+| `alert bad certificate` / handshake failure | Client must send `client.crt` + `client.key`; server needs `requestCert: true` |
+| Hostname mismatch | Use `https://localhost` and ensure `server.crt` SAN includes it |
+| `pnpm run build` fails on install | Run `pnpm approve-builds`; set `allowBuilds` to `true` in `pnpm-workspace.yaml` for packages with install scripts |
+| OpenSSL `openssl.cnf` not found (Windows) | Scripts in `certs/*.ps1` set `OPENSSL_CONF` automatically |
+
+## Further reading
+
+- [Node.js TLS documentation](https://nodejs.org/api/tls.html)
+- [RFC 8446 — TLS 1.3](https://datatracker.ietf.org/doc/html/rfc8446)
+- [NestJS FAQ — HTTP adapter](https://docs.nestjs.com/faq/http-adapter)
 
 ## License
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+UNLICENSED (private sample project).
